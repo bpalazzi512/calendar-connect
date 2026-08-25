@@ -1,0 +1,19 @@
+# Terraform
+.terraform/
+terraform/.build/
+*.tfstate
+*.tfstate.*
+crash.log
+terraform.tfvars
+*.auto.tfvars
+
+# Secrets
+*-key.json
+service-account*.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
