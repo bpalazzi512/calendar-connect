@@ -1,8 +1,9 @@
 """Calendar bot: Telegram message -> LLM -> Google Calendar event.
 
 Entry point for a 2nd-gen Google Cloud Function (HTTP trigger). Telegram POSTs
-every message to this function; we parse it with an OpenAI-compatible LLM,
-insert the resulting event into Google Calendar, and reply with a link.
+every message to this function; we parse it with an OpenAI-compatible LLM and
+either insert the resulting event into Google Calendar or change an event
+that's already there, then reply with a link.
 
 Everything is configured through environment variables (see README.md).
 """
@@ -44,13 +45,28 @@ HELP_TEXT = (
     "• <code>flight to Denver Oct 4, all day</code>\n"
     "• <code>standup tomorrow 9:15am for 15 minutes</code>\n"
     "• <code>book club every Saturday 7pm</code>\n"
-    "• <code>gym Mon Wed Fri 6am for 8 weeks</code>"
+    "• <code>gym Mon Wed Fri 6am for 8 weeks</code>\n\n"
+    "Already on the calendar? Say what should change and I'll find it:\n"
+    "• <code>move the dentist to 4pm</code>\n"
+    "• <code>push standup back 15 minutes</code>\n"
+    "• <code>lunch with Sam is at Zuni now</code>\n"
+    "• <code>make book club an hour and a half</code>\n"
+    "• <code>rename book club to reading group</code>"
 )
 
 WEEKDAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 FREQUENCIES = ("DAILY", "WEEKLY", "MONTHLY", "YEARLY")
 # A weekday code, optionally prefixed with an ordinal: SA, 1MO, -1FR.
 BYDAY_RE = re.compile(r"^(-?[1-5])?(MO|TU|WE|TH|FR|SA|SU)$")
+
+# How far to look for an event the user wants to change, when the message
+# doesn't say. Wide by default because the search is keyword-driven; narrow
+# when there's no keyword to search on and we have to list everything.
+SEARCH_PAST_DAYS = 30
+SEARCH_FUTURE_DAYS = 365
+BROWSE_PAST_DAYS = 7
+BROWSE_FUTURE_DAYS = 60
+MAX_CANDIDATES = 25
 
 
 # --------------------------------------------------------------------------
@@ -181,12 +197,15 @@ def send_typing(bot_token: str, chat_id: int | str) -> None:
 # LLM parsing
 # --------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You convert one short natural-language message into a single \
-calendar event.
+SYSTEM_PROMPT = """You turn one short natural-language message into an \
+instruction for the user's calendar. The message either describes a new event \
+or asks to change an event that is already on the calendar.
 
 Reply with ONE JSON object and nothing else. Schema:
 {{
+  "intent": "create" or "update" or "other",
   "error": string or null,
+  "search": object or null,
   "title": string,
   "all_day": boolean,
   "start": string,
@@ -196,7 +215,33 @@ Reply with ONE JSON object and nothing else. Schema:
   "recurrence": object or null
 }}
 
-Rules:
+Choose "intent" first:
+- "create" -- the message describes a new event. Fill in the event fields and \
+set "search" to null.
+- "update" -- the message points at an event that already exists and asks to \
+change it: move it, reschedule it, make it longer or shorter, rename it, \
+change where it is. Fill in "search" and set every event field to null. Do not \
+work out the new values here; you will be shown the matching event afterwards.
+- "other" -- anything else. Set "error" to a one-sentence explanation and \
+every other field to null or false.
+
+Treat the message as an update whenever it talks about the event as something \
+that exists ("move", "reschedule", "push back", "change", "rename", "actually \
+it's at ...") rather than as something to add.
+
+"search" says how to find that existing event:
+  {{"query": string, "window_start": "YYYY-MM-DD" or null, \
+"window_end": "YYYY-MM-DD" or null}}
+- "query" is one to three words likely to appear in the event's title on the \
+calendar. Leave out dates, times, and every word about the change itself: \
+"move my dentist appointment to 4pm" -> "dentist"; "push tomorrow's standup \
+back 15 min" -> "standup". Use "" only if the message names nothing \
+distinctive.
+- The window bounds the days worth searching. Leave both null for "any time"; \
+set them only when the message points at a period ("last week's ...", "the \
+lunch on the 12th").
+
+The remaining fields describe a new event, for "create":
 - "start" and "end" are local wall-clock times in the user's timezone. Never \
 include a UTC offset or timezone name.
   - Timed event: "YYYY-MM-DDTHH:MM:SS" using a 24-hour clock.
@@ -225,9 +270,54 @@ event it is an object:
 "until" for an end date ("until December 20"). Never set both. Both null means \
 it repeats forever, which is the normal case.
   - "start" and "end" describe the FIRST occurrence and must fall on a day the \
-pattern allows.
-- If the message is not a request to create an event, set "error" to a \
-one-sentence explanation and set every other field to null or false."""
+pattern allows."""
+
+
+SELECT_PROMPT = """The user wants to change an event that is already on their \
+calendar. You get their message and a numbered list of candidate events. Work \
+out which one they mean and what should change about it.
+
+Reply with ONE JSON object and nothing else. Schema:
+{
+  "error": string or null,
+  "match": integer or null,
+  "scope": "this" or "all",
+  "changes": {
+    "title": string or null,
+    "all_day": boolean or null,
+    "start": string or null,
+    "end": string or null,
+    "location": string or null,
+    "description": string or null
+  }
+}
+
+Rules:
+- "match" is the "index" of the candidate the message is about. The titles will \
+rarely match the message word for word, so pick the single best fit. Only when \
+no candidate is plausible, set "error" to a one-sentence explanation and leave \
+"match" null.
+- If several candidates fit, prefer the soonest one that is still in the \
+future, unless the message points somewhere else.
+- Every field of "changes" stays null unless the message asks to change it. \
+Never restate a value that isn't changing.
+- A new "title" is short and specific, capitalised the way a calendar title \
+is, whatever case the message used. Never put the date or time in it.
+- "start" and "end" are the NEW local wall-clock values, never a UTC offset or \
+a delta: "YYYY-MM-DDTHH:MM:SS" for a timed event, "YYYY-MM-DD" for an all-day \
+one, where "end" is the LAST day, inclusive. "push it back an hour" on a 3pm \
+event gives "start" of 16:00 the same day.
+- Moving an event means setting "start" only; leave "end" null and it keeps its \
+current length. Set "end" when the message changes the length or the end time \
+("make it 2 hours", "have it run until 5").
+- Use "" for "location" or "description" to clear one.
+- "scope" is "this" for one occurrence and "all" for every occurrence of a \
+repeating event. Candidates with "repeats": true are one occurrence of a \
+series. Default to "this"; use "all" only when the message clearly means the \
+whole series ("every", "from now on", "all my ..."). Always "this" for a \
+candidate that does not repeat.
+- Set "error" if the message asks for something these fields can't express -- \
+deleting the event, or changing how often it repeats."""
 
 
 def build_user_prompt(text: str, now: dt.datetime, tz_name: str) -> str:
@@ -247,18 +337,15 @@ def _strip_code_fences(text: str) -> str:
     return stripped.strip()
 
 
-def parse_event(text: str, cfg: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
-    """Ask the LLM for a strict JSON event. Raises RuntimeError on failure."""
+def _llm_json(
+    system: str, user: str, cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """One strict-JSON round trip to the LLM. Raises RuntimeError on failure."""
     payload = {
         "model": cfg["llm_model"],
         "messages": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(
-                    default_minutes=cfg["default_minutes"]
-                ),
-            },
-            {"role": "user", "content": build_user_prompt(text, now, cfg["timezone"])},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
@@ -293,6 +380,32 @@ def parse_event(text: str, cfg: dict[str, Any], now: dt.datetime) -> dict[str, A
     if not isinstance(parsed, dict):
         raise RuntimeError(f"LLM did not return a JSON object: {content[:300]}")
     return parsed
+
+
+def parse_event(text: str, cfg: dict[str, Any], now: dt.datetime) -> dict[str, Any]:
+    """Classify one message and, for a new event, describe it."""
+    return _llm_json(
+        SYSTEM_PROMPT.format(default_minutes=cfg["default_minutes"]),
+        build_user_prompt(text, now, cfg["timezone"]),
+        cfg,
+    )
+
+
+def choose_update(
+    text: str,
+    candidates: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    now: dt.datetime,
+) -> dict[str, Any]:
+    """Ask the LLM which candidate the message means, and what to change."""
+    tz = ZoneInfo(cfg["timezone"])
+    views = [candidate_view(i, event, tz) for i, event in enumerate(candidates)]
+    user = (
+        build_user_prompt(text, now, cfg["timezone"])
+        + "\nCandidates:\n"
+        + json.dumps(views, indent=None)
+    )
+    return _llm_json(SELECT_PROMPT, user, cfg)
 
 
 # --------------------------------------------------------------------------
@@ -475,6 +588,242 @@ def build_event_body(parsed: dict[str, Any], cfg: dict[str, Any]) -> dict[str, A
     return body
 
 
+# --------------------------------------------------------------------------
+# Finding and changing an existing event
+# --------------------------------------------------------------------------
+
+
+def _naive(value: dt.datetime) -> dt.datetime:
+    """Wall-clock, zone dropped. Arithmetic on these keeps 3pm at 3pm across a
+    DST boundary, which arithmetic on the instant would not."""
+    return value.replace(tzinfo=None)
+
+
+def _event_bounds(
+    event: dict[str, Any], tz: ZoneInfo
+) -> tuple[bool, Any, Any]:
+    """(all_day, start, end) in local terms.
+
+    Dates for an all-day event, where end is the LAST day inclusive -- the
+    opposite of Google's exclusive end, and the same convention the LLM uses.
+    Aware datetimes otherwise.
+    """
+    start, end = event.get("start") or {}, event.get("end") or {}
+    if "date" in start:
+        start_date = dt.date.fromisoformat(start["date"])
+        last_day = dt.date.fromisoformat(
+            end.get("date") or start["date"]
+        ) - dt.timedelta(days=1)
+        return True, start_date, max(last_day, start_date)
+    start_dt = _parse_local_datetime(start["dateTime"], tz)
+    end_dt = _parse_local_datetime(end.get("dateTime") or start["dateTime"], tz)
+    return False, start_dt, end_dt
+
+
+def candidate_view(index: int, event: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
+    """One event boiled down to what the LLM needs to recognise it."""
+    all_day, start, end = _event_bounds(event, tz)
+    view: dict[str, Any] = {
+        "index": index,
+        "title": event.get("summary") or "(untitled)",
+        "day": start.strftime("%A"),
+        "all_day": all_day,
+        "start": start.strftime("%Y-%m-%dT%H:%M:%S") if not all_day else start.isoformat(),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%S") if not all_day else end.isoformat(),
+        "repeats": bool(event.get("recurringEventId")),
+    }
+    for field in ("location", "description"):
+        value = event.get(field)
+        if value:
+            view[field] = str(value)[:200]
+    return view
+
+
+def _window_date(value: Any) -> dt.date | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return dt.date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        log.warning("Ignoring unreadable search window bound %r", value)
+        return None
+
+
+def find_candidates(
+    search: dict[str, Any], cfg: dict[str, Any], now: dt.datetime
+) -> list[dict[str, Any]]:
+    """Events the message might be talking about, soonest first.
+
+    Google's `q` does the first cut. If it finds nothing -- a typo, or a title
+    that shares no words with the message -- we fall back to listing a tight
+    window around today and let the LLM read the titles itself.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    today = now.date()
+    given_start = _window_date(search.get("window_start"))
+    given_end = _window_date(search.get("window_end"))
+
+    def window(past_days: int, future_days: int) -> dict[str, str]:
+        start = given_start or today - dt.timedelta(days=past_days)
+        end = given_end or today + dt.timedelta(days=future_days)
+        if end < start:
+            start, end = end, start
+        return {
+            "timeMin": dt.datetime.combine(start, dt.time.min, tzinfo=tz).isoformat(),
+            "timeMax": dt.datetime.combine(
+                end + dt.timedelta(days=1), dt.time.min, tzinfo=tz
+            ).isoformat(),
+        }
+
+    def listing(bounds: dict[str, str], query: str | None) -> list[dict[str, Any]]:
+        params = {
+            "calendarId": cfg["calendar_id"],
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "maxResults": MAX_CANDIDATES,
+            **bounds,
+        }
+        if query:
+            params["q"] = query
+        items = calendar_service().events().list(**params).execute().get("items", [])
+        return [
+            item
+            for item in items
+            if item.get("status") != "cancelled" and item.get("start")
+        ]
+
+    query = str(search.get("query") or "").strip()
+    if query:
+        found = listing(window(SEARCH_PAST_DAYS, SEARCH_FUTURE_DAYS), query)
+        if found:
+            return found
+    return listing(window(BROWSE_PAST_DAYS, BROWSE_FUTURE_DAYS), None)
+
+
+def _changed_text(changes: dict[str, Any], field: str) -> str | None:
+    value = changes.get(field)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def build_update_patch(
+    event: dict[str, Any], changes: dict[str, Any], cfg: dict[str, Any]
+) -> tuple[dict[str, Any], tuple[dt.timedelta, dt.timedelta] | None]:
+    """Turn the LLM's change set into a Calendar patch for one event.
+
+    Also returns how far start and end moved, which is what the caller needs to
+    push the same move onto a whole series instead of one occurrence. It's None
+    when the move can't be expressed as a shift -- an event switching between
+    timed and all-day.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    patch: dict[str, Any] = {}
+
+    title = _changed_text(changes, "title")
+    if title:
+        patch["summary"] = title
+    for field in ("location", "description"):
+        value = changes.get(field)
+        if isinstance(value, str):
+            patch[field] = value.strip()  # "" clears it
+
+    start_raw = _changed_text(changes, "start")
+    end_raw = _changed_text(changes, "end")
+    wanted_all_day = changes.get("all_day")
+    was_all_day, cur_start, cur_end = _event_bounds(event, tz)
+    all_day = wanted_all_day if isinstance(wanted_all_day, bool) else was_all_day
+
+    if not (start_raw or end_raw or all_day != was_all_day):
+        return patch, None
+
+    try:
+        if all_day:
+            cur_start_date = cur_start if was_all_day else cur_start.date()
+            cur_end_date = cur_end if was_all_day else cur_end.date()
+            new_start = (
+                dt.date.fromisoformat(start_raw[:10]) if start_raw else cur_start_date
+            )
+            if end_raw:
+                new_end = dt.date.fromisoformat(end_raw[:10])
+            else:
+                new_end = cur_end_date + (new_start - cur_start_date)
+            new_end = max(new_end, new_start)
+            patch["start"] = {"date": new_start.isoformat()}
+            # Google's all-day end is exclusive; ours is the last day.
+            patch["end"] = {"date": (new_end + dt.timedelta(days=1)).isoformat()}
+            shift = (
+                (new_start - cur_start_date, new_end - cur_end_date)
+                if was_all_day
+                else None
+            )
+        else:
+            if start_raw:
+                new_start = _parse_local_datetime(start_raw, tz)
+            elif was_all_day:
+                raise RuntimeError("Tell me what time it should start.")
+            else:
+                new_start = cur_start
+
+            if end_raw:
+                new_end = _parse_local_datetime(end_raw, tz)
+            elif was_all_day:
+                new_end = new_start + dt.timedelta(minutes=cfg["default_minutes"])
+            else:
+                # No new end: keep the length the event already had.
+                moved = _naive(new_start) - _naive(cur_start)
+                new_end = (_naive(cur_end) + moved).replace(tzinfo=tz)
+            if new_end <= new_start:
+                new_end = new_start + dt.timedelta(minutes=cfg["default_minutes"])
+
+            patch["start"] = {"dateTime": new_start.isoformat(), "timeZone": cfg["timezone"]}
+            patch["end"] = {"dateTime": new_end.isoformat(), "timeZone": cfg["timezone"]}
+            shift = (
+                None
+                if was_all_day
+                else (
+                    _naive(new_start) - _naive(cur_start),
+                    _naive(new_end) - _naive(cur_end),
+                )
+            )
+    except ValueError as exc:
+        raise RuntimeError(f"The LLM returned an unreadable date: {exc}") from exc
+
+    return patch, shift
+
+
+def shift_event_times(
+    event: dict[str, Any], shift: tuple[dt.timedelta, dt.timedelta], cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """The start/end half of a patch that moves `event` by `shift`.
+
+    The LLM works from one occurrence, so its new times are absolute and only
+    fit that occurrence. Re-deriving them from the series' own start is what
+    makes "move all my standups to 4pm" land on the series.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    start_delta, end_delta = shift
+    start, end = event.get("start") or {}, event.get("end") or {}
+
+    if "date" in start:
+        new_start = dt.date.fromisoformat(start["date"]) + start_delta
+        new_end = dt.date.fromisoformat(end["date"]) + end_delta
+        return {"start": {"date": new_start.isoformat()}, "end": {"date": new_end.isoformat()}}
+
+    new_start = (
+        _naive(_parse_local_datetime(start["dateTime"], tz)) + start_delta
+    ).replace(tzinfo=tz)
+    new_end = (_naive(_parse_local_datetime(end["dateTime"], tz)) + end_delta).replace(
+        tzinfo=tz
+    )
+    return {
+        "start": {"dateTime": new_start.isoformat(), "timeZone": cfg["timezone"]},
+        "end": {"dateTime": new_end.isoformat(), "timeZone": cfg["timezone"]},
+    }
+
+
+# --------------------------------------------------------------------------
+# Receipts
+# --------------------------------------------------------------------------
+
 DAY_NAMES = {
     "MO": "Monday",
     "TU": "Tuesday",
@@ -546,34 +895,35 @@ def describe_recurrence(rule: str) -> str:
     return text
 
 
-def format_confirmation(event: dict[str, Any], tz_name: str) -> str:
-    """Human-readable receipt for the created event."""
-    tz = ZoneInfo(tz_name)
-    start, end = event["start"], event["end"]
-
-    if "date" in start:
-        start_date = dt.date.fromisoformat(start["date"])
-        # End date came back exclusive; show the inclusive last day.
-        end_date = dt.date.fromisoformat(end["date"]) - dt.timedelta(days=1)
-        if end_date <= start_date:
-            when = start_date.strftime("%a, %b %-d, %Y") + " · all day"
-        else:
-            when = (
-                f"{start_date.strftime('%a, %b %-d')} – "
-                f"{end_date.strftime('%a, %b %-d, %Y')} · all day"
-            )
-    else:
-        start_dt = dt.datetime.fromisoformat(start["dateTime"]).astimezone(tz)
-        end_dt = dt.datetime.fromisoformat(end["dateTime"]).astimezone(tz)
-        when = (
-            f"{start_dt.strftime('%a, %b %-d, %Y')} · "
-            f"{start_dt.strftime('%-I:%M %p')} – {end_dt.strftime('%-I:%M %p')}"
+def describe_when(event: dict[str, Any], tz_name: str) -> str:
+    """"Thu, Aug 20, 2026 · 3:00 PM – 4:00 PM", or the all-day equivalent."""
+    all_day, start, end = _event_bounds(event, ZoneInfo(tz_name))
+    if all_day:
+        if end <= start:
+            return start.strftime("%a, %b %-d, %Y") + " · all day"
+        return (
+            f"{start.strftime('%a, %b %-d')} – "
+            f"{end.strftime('%a, %b %-d, %Y')} · all day"
         )
+    return (
+        f"{start.strftime('%a, %b %-d, %Y')} · "
+        f"{start.strftime('%-I:%M %p')} – {end.strftime('%-I:%M %p')}"
+    )
 
+
+def format_confirmation(
+    event: dict[str, Any],
+    tz_name: str,
+    *,
+    icon: str = "✅",
+    extra: list[str] | None = None,
+) -> str:
+    """Human-readable receipt for an event we just created or changed."""
     lines = [
-        f"✅ <b>{html.escape(event.get('summary', 'Event'))}</b>",
-        f"🗓 {html.escape(when)}",
+        f"{icon} <b>{html.escape(event.get('summary', 'Event'))}</b>",
+        f"🗓 {html.escape(describe_when(event, tz_name))}",
     ]
+    lines.extend(extra or [])
     for rule in event.get("recurrence") or []:
         if str(rule).startswith("RRULE:"):
             lines.append(f"🔁 {html.escape(describe_recurrence(rule))}")
@@ -587,6 +937,164 @@ def format_confirmation(event: dict[str, Any], tz_name: str) -> str:
 # --------------------------------------------------------------------------
 # Request handling
 # --------------------------------------------------------------------------
+
+
+def _complain(chat_id: int | str, cfg: dict[str, Any], message: str) -> None:
+    send_message(cfg["bot_token"], chat_id, f"⚠️ {html.escape(message)}")
+
+
+def _calendar_failure(
+    chat_id: int | str, cfg: dict[str, Any], what: str, exc: Exception
+) -> None:
+    send_message(
+        cfg["bot_token"],
+        chat_id,
+        f"⚠️ Couldn't {what}:\n<code>{html.escape(str(exc)[:400])}</code>",
+    )
+
+
+def handle_create(
+    chat_id: int | str, cfg: dict[str, Any], parsed: dict[str, Any]
+) -> None:
+    try:
+        body = build_event_body(parsed, cfg)
+    except RuntimeError as exc:
+        log.error("Bad event from LLM: %s (%s)", exc, parsed)
+        _complain(chat_id, cfg, str(exc))
+        return
+
+    try:
+        event = (
+            calendar_service()
+            .events()
+            .insert(calendarId=cfg["calendar_id"], body=body)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001 - always report back to the user
+        log.exception("Calendar insert failed")
+        _calendar_failure(chat_id, cfg, "add the event to your calendar", exc)
+        return
+
+    send_message(cfg["bot_token"], chat_id, format_confirmation(event, cfg["timezone"]))
+
+
+def handle_update(
+    text: str,
+    chat_id: int | str,
+    cfg: dict[str, Any],
+    parsed: dict[str, Any],
+    now: dt.datetime,
+) -> None:
+    """Find the event the message is about, then patch it."""
+    search = parsed.get("search")
+    if not isinstance(search, dict):
+        search = {}
+
+    try:
+        candidates = find_candidates(search, cfg, now)
+    except Exception as exc:  # noqa: BLE001 - always report back to the user
+        log.exception("Calendar search failed")
+        _calendar_failure(chat_id, cfg, "search your calendar", exc)
+        return
+
+    if not candidates:
+        send_message(
+            cfg["bot_token"],
+            chat_id,
+            "🤔 I couldn't find an event like that on your calendar.",
+        )
+        return
+
+    try:
+        decision = choose_update(text, candidates, cfg, now)
+    except RuntimeError as exc:
+        log.exception("LLM match failed")
+        _complain(chat_id, cfg, str(exc))
+        return
+
+    if decision.get("error"):
+        send_message(
+            cfg["bot_token"], chat_id, f"🤔 {html.escape(str(decision['error']))}"
+        )
+        return
+
+    try:
+        index = int(decision.get("match"))
+        event = candidates[index]
+    except (TypeError, ValueError, IndexError):
+        log.error("LLM picked no usable candidate: %s", decision)
+        send_message(
+            cfg["bot_token"],
+            chat_id,
+            "🤔 I couldn't tell which event you meant. Try naming it the way "
+            "it appears on your calendar.",
+        )
+        return
+
+    changes = decision.get("changes")
+    if not isinstance(changes, dict):
+        changes = {}
+
+    try:
+        patch, shift = build_update_patch(event, changes, cfg)
+    except RuntimeError as exc:
+        log.error("Bad change set from LLM: %s (%s)", exc, decision)
+        _complain(chat_id, cfg, str(exc))
+        return
+
+    if not patch:
+        send_message(
+            cfg["bot_token"],
+            chat_id,
+            f"🤔 I found <b>{html.escape(event.get('summary') or 'that event')}</b> "
+            "but couldn't tell what to change about it.",
+        )
+        return
+
+    series = str(decision.get("scope") or "this").lower() == "all"
+    series = series and bool(event.get("recurringEventId"))
+    target = event["id"]
+
+    try:
+        if series:
+            target = event["recurringEventId"]
+            master = (
+                calendar_service()
+                .events()
+                .get(calendarId=cfg["calendar_id"], eventId=target)
+                .execute()
+            )
+            if shift and ("start" in patch or "end" in patch):
+                # The LLM's absolute times belong to the occurrence it was
+                # shown; the series starts on some other day.
+                patch.update(shift_event_times(master, shift, cfg))
+            before = describe_when(master, cfg["timezone"])
+        else:
+            before = describe_when(event, cfg["timezone"])
+
+        updated = (
+            calendar_service()
+            .events()
+            .patch(calendarId=cfg["calendar_id"], eventId=target, body=patch)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001 - always report back to the user
+        log.exception("Calendar update failed")
+        _calendar_failure(chat_id, cfg, "update that event", exc)
+        return
+
+    extra = []
+    after = describe_when(updated, cfg["timezone"])
+    if after != before:
+        extra.append(f"↩️ <s>{html.escape(before)}</s>")
+    if event.get("recurringEventId"):
+        extra.append("🔁 every occurrence" if series else "🔂 this occurrence only")
+
+    send_message(
+        cfg["bot_token"],
+        chat_id,
+        format_confirmation(updated, cfg["timezone"], icon="✏️", extra=extra),
+    )
 
 
 def handle_text(text: str, chat_id: int | str, cfg: dict[str, Any]) -> None:
@@ -603,7 +1111,7 @@ def handle_text(text: str, chat_id: int | str, cfg: dict[str, Any]) -> None:
         parsed = parse_event(text, cfg, now)
     except RuntimeError as exc:
         log.exception("LLM parse failed")
-        send_message(cfg["bot_token"], chat_id, f"⚠️ {html.escape(str(exc))}")
+        _complain(chat_id, cfg, str(exc))
         return
 
     if parsed.get("error"):
@@ -612,31 +1120,10 @@ def handle_text(text: str, chat_id: int | str, cfg: dict[str, Any]) -> None:
         )
         return
 
-    try:
-        body = build_event_body(parsed, cfg)
-    except RuntimeError as exc:
-        log.error("Bad event from LLM: %s (%s)", exc, parsed)
-        send_message(cfg["bot_token"], chat_id, f"⚠️ {html.escape(str(exc))}")
+    if str(parsed.get("intent") or "create").lower() == "update":
+        handle_update(text, chat_id, cfg, parsed, now)
         return
-
-    try:
-        event = (
-            calendar_service()
-            .events()
-            .insert(calendarId=cfg["calendar_id"], body=body)
-            .execute()
-        )
-    except Exception as exc:  # noqa: BLE001 - always report back to the user
-        log.exception("Calendar insert failed")
-        send_message(
-            cfg["bot_token"],
-            chat_id,
-            "⚠️ Couldn't add the event to your calendar:\n"
-            f"<code>{html.escape(str(exc)[:400])}</code>",
-        )
-        return
-
-    send_message(cfg["bot_token"], chat_id, format_confirmation(event, cfg["timezone"]))
+    handle_create(chat_id, cfg, parsed)
 
 
 @functions_framework.http

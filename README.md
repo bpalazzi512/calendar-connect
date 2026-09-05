@@ -2,7 +2,8 @@
 
 Text a Telegram bot in plain English — *"dentist next Tuesday 3pm"*, *"book club
 every Saturday 7pm"* — and the event lands on your Google Calendar, one-off or
-recurring. You get a confirmation with a link back.
+recurring. Say *"move the dentist to 4pm"* and it finds that event and changes
+it. You get a confirmation with a link back.
 
 See [initial-plan.md](initial-plan.md) for the design rationale. This file is
 the build-and-run guide.
@@ -10,7 +11,9 @@ the build-and-run guide.
 ```
 you ──▶ Telegram ──POST──▶ Cloud Function ──▶ LLM (parse to JSON)
                                 │
-                                └──▶ Google Calendar (insert)
+                                ├──▶ new event?     Calendar insert
+                                ├──▶ a change?      Calendar search ──▶ LLM
+                                │                   (pick one) ──▶ Calendar patch
                                 └──▶ Telegram (reply with link)
 ```
 
@@ -18,7 +21,7 @@ you ──▶ Telegram ──POST──▶ Cloud Function ──▶ LLM (parse t
 
 | Path | What it is |
 | --- | --- |
-| `src/main.py` | The whole function: verify → parse → insert → reply |
+| `src/main.py` | The whole function: verify → parse → insert or patch → reply |
 | `src/requirements.txt` | Python dependencies |
 | `terraform/` | All the infrastructure |
 | `terraform/terraform.tfvars.example` | Template for your settings |
@@ -275,6 +278,10 @@ Other things it handles:
 | `1:1 every other Tuesday 10am` | Repeats fortnightly |
 | `retro last Friday of the month 4pm` | Repeats monthly on the last Friday |
 | `rent reminder monthly until Dec 20` | Repeats monthly with an end date |
+| `move the dentist to 4pm` | Finds the dentist event and moves it |
+| `push standup back 15 minutes` | Same event, 15 minutes later |
+| `make book club an hour and a half` | Changes the length, not the start |
+| `lunch with Sam is at Zuni now` | Sets the location |
 | `/help` | The usage hint |
 | `how are you` | 🤔 "That isn't a request to create an event" |
 
@@ -310,10 +317,57 @@ Two details worth knowing:
   timezone, so a 7pm series stays at 7pm across a DST change rather than
   drifting to 6pm.
 
-To change or cancel a series, use Google Calendar — the bot only creates.
+Moving a series is covered below. To cancel one, use Google Calendar.
+
+### Changing an event
+
+Talk about an event that already exists and the bot goes and finds it — you
+never give it an id, and you don't have to name it the way the calendar does:
+
+```
+move the dentist to 4pm
+```
+
+> ✏️ **Dentist**
+> 🗓 Thu, Sep 3, 2026 · 4:00 PM – 5:00 PM
+> ↩️ ~~Thu, Sep 3, 2026 · 3:00 PM – 4:00 PM~~
+> [Open in Calendar](#)
+
+The old time is struck through so you can see what actually moved. Start time,
+end time, length, title, location and description are all fair game, and
+switching an event to or from all-day works too.
+
+It takes two LLM calls. The first decides whether the message creates something
+or changes something, and for a change pulls out a search term — *"push
+tomorrow's standup back 15 min"* gives `standup`. That searches the calendar.
+The second call sees the real events that came back and picks the one you meant,
+then works out the new values from what it can see. So the model never has to
+guess an event's current time; it reads it.
+
+A few behaviours worth knowing:
+
+- **Moving keeps the length.** Change only the start and the event keeps its
+  duration. Say *"make it two hours"* or *"until 5"* to change the length.
+- **The search widens if it comes up empty.** A keyword search covers a month
+  back and a year ahead. If it matches nothing — a title with no words in
+  common with your message — the bot lists everything from a week back to two
+  months ahead and lets the model read the titles itself.
+- **One occurrence by default.** *"Move Thursday's standup to 4"* moves that
+  Thursday. *"Move all my standups to 4"* — "every", "all", "from now on" —
+  moves the series, and the reply says which it did (🔂 vs 🔁). A series move is
+  re-derived from the series' own start date, so the whole thing shifts by the
+  same amount rather than collapsing onto the occurrence you mentioned.
+- **Wall-clock survives DST here too.** Same reasoning as for creation: a series
+  moved to 8pm is at 8pm on both sides of a time change.
+
+When the model can't find a plausible match, it says so rather than editing
+something at random:
+
+> 🤔 I couldn't find an event like that on your calendar.
 
 The first message after an idle period takes a few seconds (cold start).
-Telegram waits up to 60s, so it just feels slow, never broken.
+Telegram waits up to 60s, so it just feels slow, never broken. A change is two
+LLM calls plus two calendar calls, so it runs a little longer than a create.
 
 ---
 
@@ -345,6 +399,9 @@ export LLM_API_KEY=sk-...
 
 It prints the raw LLM JSON, the exact Calendar API body, and the reply you'd
 get — the fastest way to see whether a miss is the model's fault or the code's.
+For a message that changes an event it stops after the first call and prints
+the search it would run, since matching needs calendar access this script
+deliberately doesn't have.
 
 **Rotate a secret.** Change it in `terraform.tfvars` and apply; a new secret
 version is created and the function picks it up (it reads `latest`). For the
@@ -400,6 +457,10 @@ failing. If `url` is empty, the webhook was never registered.
 | ⚠️ `Unsupported repeat frequency/day` | Model invented a recurrence field | Rephrase ("every other Tuesday" beats "biweekly"); check with `try-parse.py` |
 | One-off event when you meant a series | Model didn't read it as recurring | Use the word "every" — "every Saturday", not "Saturdays" |
 | Repeating event but the wrong pattern | Model's `byday`/`interval` was off | `try-parse.py` prints the RRULE; fix the series in Google Calendar |
+| A change created a second event instead | Model read it as a new event | Lead with a verb — "move the dentist…", not "dentist at 4pm"; `try-parse.py` prints the intent it chose |
+| 🤔 `I couldn't find an event like that` | Search matched nothing in range | Use a word from the event's actual title; say when it is ("last week's…") |
+| It changed the wrong event | Several similar titles in range | Say which one — "the dentist on the 12th" |
+| It moved one occurrence, you meant all | Scope defaulted to this occurrence | Say "every" or "all my …" |
 | `terraform apply`: build fails with a permissions error | IAM hadn't propagated | Just run `terraform apply` again |
 | `terraform apply`: `allUsers` policy rejected | Org policy `iam.allowedPolicyMemberDomains` | Deploy in a personal (non-org) project, or ask an admin to exempt it |
 | `terraform apply`: `Permission denied ... actAs` | Missing Service Account User | Grant yourself Owner, or `roles/iam.serviceAccountUser` |
@@ -486,8 +547,13 @@ matters.
 
 ## Known limitations
 
-- **Create only.** The bot adds events (including recurring series); it can't
-  edit, move, or delete them. Do that in Google Calendar.
+- **No deleting.** The bot creates and changes events; it won't cancel one.
+  Do that in Google Calendar.
+- **The repeat pattern is fixed once set.** A change can move a series or rename
+  it, but not turn a weekly event into a monthly one. Asking gets you a 🤔
+  rather than a surprise.
+- **One event per message.** A message that changes two events at once picks
+  one of them.
 
 Two more are deliberate, per the plan:
 
