@@ -17,6 +17,10 @@ llm_api_key = "sk-..."
 # Swapping providers is these three settings and nothing else.
 llm_base_url = "https://api.deepseek.com/v1"
 llm_model    = "deepseek-v4-flash"
+# How long to wait for the model. Reasoning models spend most of their latency
+# on hidden chain-of-thought, so a wordy or ambiguous message can take 25s+.
+# Must stay more than 10s below function_timeout_seconds (default 120).
+# llm_timeout_seconds = 45
 
 # --- Calendar -------------------------------------------------------------
 # Your real calendar id (usually your email address), NOT "primary".

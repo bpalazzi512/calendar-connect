@@ -21,7 +21,7 @@ resource "google_cloudfunctions2_function" "bot" {
 
   service_config {
     available_memory      = "256Mi"
-    timeout_seconds       = 60
+    timeout_seconds       = var.function_timeout_seconds
     max_instance_count    = var.max_instance_count
     min_instance_count    = var.min_instance_count
     ingress_settings      = "ALLOW_ALL"
@@ -31,6 +31,7 @@ resource "google_cloudfunctions2_function" "bot" {
       ALLOWED_TELEGRAM_USER_ID = var.allowed_telegram_user_id
       LLM_BASE_URL             = var.llm_base_url
       LLM_MODEL                = var.llm_model
+      LLM_TIMEOUT_SECONDS      = tostring(var.llm_timeout_seconds)
       CALENDAR_ID              = var.calendar_id
       TIMEZONE                 = var.timezone
       DEFAULT_EVENT_MINUTES    = tostring(var.default_event_minutes)
@@ -67,6 +68,13 @@ resource "google_cloudfunctions2_function" "bot" {
         secret     = google_secret_manager_secret.calendar_sa_key[0].secret_id
         version    = "latest"
       }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.function_timeout_seconds > var.llm_timeout_seconds + 10
+      error_message = "function_timeout_seconds must exceed llm_timeout_seconds by more than 10s, or a slow LLM call leaves no room to insert the event and reply before Cloud Functions kills the request."
     }
   }
 
