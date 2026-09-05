@@ -13,8 +13,39 @@ locals {
   # keys below are known at plan time.
   all_secret_ids = concat(
     [for k in keys(local.secrets) : "${var.function_name}-${k}"],
+    ["${var.function_name}-api-token"],
     local.use_sa_key ? ["${var.function_name}-calendar-sa-key"] : [],
   )
+}
+
+# Token for the /event API the Mac hotkey and the iOS Shortcut call.
+# Generated rather than asked for: there's nothing to choose here, and it
+# saves a variable you'd otherwise have to invent and keep out of git.
+# Read it back with ./scripts/api-token.sh.
+#
+# Kept out of local.secrets, and so out of that for_each, so the map stays
+# built from plain variables.
+resource "random_password" "api_token" {
+  length = 48
+  # Alphanumeric only: this gets pasted into a curl header, a shell script
+  # and a Shortcuts text field, none of which need the quoting practice.
+  special = false
+}
+
+resource "google_secret_manager_secret" "api_token" {
+  project   = var.project_id
+  secret_id = "${var.function_name}-api-token"
+
+  replication {
+    auto {}
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_version" "api_token" {
+  secret      = google_secret_manager_secret.api_token.id
+  secret_data = random_password.api_token.result
 }
 
 resource "google_secret_manager_secret" "this" {
@@ -67,6 +98,7 @@ resource "google_secret_manager_secret_iam_member" "bot_access" {
 
   depends_on = [
     google_secret_manager_secret.this,
+    google_secret_manager_secret.api_token,
     google_secret_manager_secret.calendar_sa_key,
   ]
 }

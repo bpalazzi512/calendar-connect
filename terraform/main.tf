@@ -128,7 +128,16 @@ data "archive_file" "source" {
   type        = "zip"
   source_dir  = "${path.module}/../src"
   output_path = "${path.module}/.build/function-source.zip"
-  excludes    = ["__pycache__", ".pytest_cache", ".DS_Store"]
+  # These patterns don't cross directory levels, so each package under src/
+  # needs its own line -- a nested __pycache__ otherwise rides along in the
+  # zip and changes its hash, forcing a rebuild that deploys nothing new.
+  excludes = [
+    "__pycache__",
+    "*/__pycache__",
+    ".pytest_cache",
+    ".DS_Store",
+    "*/.DS_Store",
+  ]
 }
 
 resource "google_storage_bucket_object" "source" {

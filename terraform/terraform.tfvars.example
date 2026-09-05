@@ -1,6 +1,6 @@
 # Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
 
-project_id = "my-calendar-bot-project"
+project_id = "my-calendar-connect-project"
 region     = "us-central1"
 
 # --- Telegram -------------------------------------------------------------

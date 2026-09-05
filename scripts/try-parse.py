@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Run one message through the LLM locally and print what the bot would do.
-Touches the LLM only -- never Telegram, never your calendar.
+"""Run one message through the LLM locally and see what Calendar Connect
+would do with it.
+Touches the LLM only -- never a channel, never your calendar.
 
     pip install -r src/requirements.txt
     export LLM_API_KEY=sk-...
@@ -31,7 +32,11 @@ os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "unused")
 os.environ.setdefault("ALLOWED_TELEGRAM_USER_ID", "0")
 os.environ.setdefault("CALENDAR_ID", "unused")
 
-import main  # noqa: E402
+import calendar_api  # noqa: E402
+import config  # noqa: E402
+import events  # noqa: E402
+import llm  # noqa: E402
+import receipts  # noqa: E402
 
 
 def report_update(parsed: dict, cfg: dict, now: dt.datetime) -> int:
@@ -43,25 +48,25 @@ def report_update(parsed: dict, cfg: dict, now: dt.datetime) -> int:
 
     today = now.date()
     start = search.get("window_start") or (
-        today - dt.timedelta(days=main.SEARCH_PAST_DAYS)
+        today - dt.timedelta(days=calendar_api.SEARCH_PAST_DAYS)
     )
     end = search.get("window_end") or (
-        today + dt.timedelta(days=main.SEARCH_FUTURE_DAYS)
+        today + dt.timedelta(days=calendar_api.SEARCH_FUTURE_DAYS)
     )
 
     print("\nThis is a change to an existing event.")
     print(f"  search:  {search.get('query') or '(no keywords)'!r}")
     print(f"  between: {start} and {end}")
     print(
-        "\nThe bot would list matching events and make a second LLM call to pick"
-        "\none and work out the new values. That step needs your calendar, so it"
-        "\ndoesn't run here."
+        "\nCalendar Connect would list the matching events and make a second"
+        "\nLLM call to pick one and work out the new values. That step needs"
+        "\nyour calendar, so it doesn't run here."
     )
     return 0
 
 
 def run(text: str) -> int:
-    cfg = main._config()
+    cfg = config.load()
     now = dt.datetime.now(ZoneInfo(cfg["timezone"]))
 
     print(f"model:    {cfg['llm_model']}  @  {cfg['llm_base_url']}")
@@ -69,7 +74,7 @@ def run(text: str) -> int:
     print(f"message:  {text}\n")
 
     try:
-        parsed = main.parse_event(text, cfg, now)
+        parsed = llm.parse_event(text, cfg, now)
     except RuntimeError as exc:
         print(f"LLM error: {exc}")
         return 1
@@ -85,7 +90,7 @@ def run(text: str) -> int:
         return report_update(parsed, cfg, now)
 
     try:
-        body = main.build_event_body(parsed, cfg)
+        body = events.build_event_body(parsed, cfg)
     except RuntimeError as exc:
         print(f"\nUnusable event: {exc}")
         return 1
@@ -93,7 +98,8 @@ def run(text: str) -> int:
     print("\nCalendar event that would be inserted:")
     print(json.dumps(body, indent=2))
     print("\nConfirmation you'd get back:")
-    print(main.format_confirmation(body, cfg["timezone"]))
+    # A Message prints as its plain form -- what the Mac and phone show.
+    print(receipts.format_confirmation(body, cfg["timezone"]))
     return 0
 
 
