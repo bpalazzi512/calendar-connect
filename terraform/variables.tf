@@ -76,6 +76,23 @@ variable "llm_model" {
   default     = "deepseek-v4-flash"
 }
 
+variable "llm_timeout_seconds" {
+  type        = number
+  description = <<-EOT
+    How long to wait for the LLM's chat-completions response. Reasoning models
+    such as deepseek-v4-flash spend nearly all of their latency on hidden
+    chain-of-thought, and one ambiguous message can swing a single call between
+    7s and 26s. Keep this comfortably under var.function_timeout_seconds so a
+    slow parse still leaves room to insert the event and reply.
+  EOT
+  default     = 45
+
+  validation {
+    condition     = var.llm_timeout_seconds >= 5 && var.llm_timeout_seconds <= 540
+    error_message = "Must be between 5 and 540 seconds."
+  }
+}
+
 # --- Calendar -------------------------------------------------------------
 
 variable "calendar_id" {
@@ -152,6 +169,21 @@ variable "image_keep_count" {
 }
 
 # --- Function sizing ------------------------------------------------------
+
+variable "function_timeout_seconds" {
+  type        = number
+  description = <<-EOT
+    Hard ceiling on one request. Has to outlast the LLM call plus the Calendar
+    insert -- if it doesn't, Cloud Functions kills the request and the user
+    gets silence instead of an error.
+  EOT
+  default     = 120
+
+  validation {
+    condition     = var.function_timeout_seconds >= 1 && var.function_timeout_seconds <= 3600
+    error_message = "Cloud Functions 2nd gen allows 1-3600 seconds."
+  }
+}
 
 variable "max_instance_count" {
   type        = number
