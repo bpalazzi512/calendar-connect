@@ -3,6 +3,16 @@ output "function_url" {
   value       = google_cloudfunctions2_function.bot.service_config[0].uri
 }
 
+output "event_url" {
+  description = "Endpoint the macOS hotkey and the iOS Shortcut POST to."
+  value       = "${google_cloudfunctions2_function.bot.service_config[0].uri}/event"
+}
+
+output "api_token_command" {
+  description = "Print the bearer token for the /event API."
+  value       = "./scripts/api-token.sh"
+}
+
 output "project_id" {
   description = "Project the bot is deployed in."
   value       = var.project_id

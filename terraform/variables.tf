@@ -11,8 +11,18 @@ variable "region" {
 
 variable "function_name" {
   type        = string
-  description = "Name of the Cloud Function (also the name of the underlying Cloud Run service)."
-  default     = "calendar-bot"
+  description = <<-EOT
+    Name of the Cloud Function, and the stem of nearly every other name: the
+    Cloud Run service, the service account, the secrets, the source bucket and
+    the image repo.
+
+    Changing it on a live deployment replaces all of them. The one that hurts
+    is the service account -- a new one has a new address, and your calendar is
+    shared with the old one, so events silently stop being written until you
+    redo that share by hand. Pin the old value in terraform.tfvars instead,
+    unless you mean it.
+  EOT
+  default     = "calendar-connect"
 }
 
 variable "runtime" {

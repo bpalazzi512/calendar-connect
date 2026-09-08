@@ -2,11 +2,11 @@ resource "google_cloudfunctions2_function" "bot" {
   project     = var.project_id
   name        = var.function_name
   location    = var.region
-  description = "Turns Telegram messages into Google Calendar events."
+  description = "Turns plain-English messages into Google Calendar events."
 
   build_config {
     runtime     = var.runtime
-    entry_point = "telegram_webhook"
+    entry_point = "handle_request"
 
     # Our repo, with the cleanup policy, instead of the auto-created one.
     docker_repository = google_artifact_registry_repository.images.id
@@ -53,6 +53,13 @@ resource "google_cloudfunctions2_function" "bot" {
     }
 
     secret_environment_variables {
+      key        = "API_TOKEN"
+      project_id = var.project_id
+      secret     = google_secret_manager_secret.api_token.secret_id
+      version    = "latest"
+    }
+
+    secret_environment_variables {
       key        = "LLM_API_KEY"
       project_id = var.project_id
       secret     = google_secret_manager_secret.this["llm-api-key"].secret_id
@@ -84,6 +91,7 @@ resource "google_cloudfunctions2_function" "bot" {
     google_artifact_registry_repository_iam_member.build_writes,
     google_artifact_registry_repository_iam_member.run_reads,
     google_secret_manager_secret_version.this,
+    google_secret_manager_secret_version.api_token,
     time_sleep.wait_for_iam,
   ]
 }
