@@ -55,10 +55,27 @@ def _json(payload: dict[str, Any], status: int = 200):
     )
 
 
-def _bearer_token(request) -> str:
-    header = request.headers.get("Authorization", "")
-    prefix = "Bearer "
-    return header[len(prefix) :] if header.startswith(prefix) else ""
+def _presented_token(request) -> str:
+    """The token the caller presented, in whichever shape it arrived.
+
+    Three are accepted, and they're equally strong -- a secret in a header,
+    compared the same way. Which one you use is purely about what's convenient
+    to type on the other end:
+
+    * ``X-Api-Token: <token>``       no space anywhere, which is the one to
+                                    reach for in a Shortcuts header field
+    * ``Authorization: Bearer <t>``  the standard form, what curl examples use
+    * ``Authorization: <token>``     the same thing without the ceremony
+    """
+    token = request.headers.get("X-Api-Token", "").strip()
+    if token:
+        return token
+
+    header = request.headers.get("Authorization", "").strip()
+    scheme, _, rest = header.partition(" ")
+    if rest and scheme.lower() == "bearer":
+        return rest.strip()
+    return header
 
 
 def handle(request):
@@ -83,7 +100,9 @@ def handle(request):
         log.error("API_TOKEN is unset; refusing to serve /event")
         return _json({"ok": False, "message": "API is not enabled."}, 503)
 
-    if not hmac.compare_digest(_bearer_token(request), cfg["api_token"]):
+    # Compared against every accepted header shape; see _presented_token.
+
+    if not hmac.compare_digest(_presented_token(request), cfg["api_token"]):
         log.warning("Rejected /event request with a bad or missing token")
         return _json({"ok": False, "message": "Forbidden."}, 403)
 

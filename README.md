@@ -467,11 +467,20 @@ coming back in the HTTP response instead of over Telegram.
 
 ```
 POST https://…-uc.a.run.app/event
-Authorization: Bearer <token from ./scripts/api-token.sh>
+X-Api-Token: <token from ./scripts/api-token.sh>
 Content-Type: application/json
 
 {"text": "dentist next Tuesday 3pm"}
 ```
+
+Three header shapes are accepted, and they're equally strong — the same secret,
+compared the same way. Pick whichever is least annoying to type at your end:
+
+| Header | Why you'd use it |
+| --- | --- |
+| `X-Api-Token: <token>` | No space anywhere in the value. This is the one for a Shortcuts header field |
+| `Authorization: Bearer <token>` | The standard form. What the `curl` examples use |
+| `Authorization: <token>` | The same thing without the ceremony |
 
 ```json
 {
@@ -491,7 +500,7 @@ updates at once. Nothing downstream needs touching.
 | --- | --- |
 | `200` | Calendar Connect handled it. Check `ok` — `false` means *"I couldn't find that event"*, which is an answer, not an error |
 | `400` | Empty or missing `text` |
-| `403` | Bad or missing bearer token |
+| `403` | Bad or missing token, in every accepted header shape |
 | `405` | Not a POST |
 | `503` | `API_TOKEN` isn't set on the function — `/event` fails closed rather than open |
 
@@ -531,12 +540,18 @@ Open **Shortcuts** → **+** → name it (see the warning below) → add six act
 | 1 | **If** | `Shortcut Input` · *has any value* |
 | 2 | ↳ **Set Variable** | `EventText` = `Shortcut Input` |
 | 3 | **Otherwise** → **Ask for Input** | Type `Text`, prompt *"What's the event?"* — then **Set Variable** `EventText` to `Provided Input` |
-| 4 | **Get Contents of URL** | URL = your `event_url`<br>Method `POST`<br>Headers: `Authorization` = `Bearer <token>`<br>Request Body `JSON`, one field: `text` = `EventText` |
+| 4 | **Get Contents of URL** | URL = your `event_url`<br>Method `POST`<br>Headers: `X-Api-Token` = `<token>`<br>Request Body `JSON`, one field: `text` = `EventText` |
 | 5 | **Get Dictionary Value** | Get `Value` for `message` in `Contents of URL` |
 | 6 | **Show Notification** | The dictionary value from step 5 |
 
 The `If` in step 1 is what lets one shortcut serve both entry points: the share
 sheet hands it text, the hotkey hands it nothing and so it asks.
+
+Use `X-Api-Token` rather than `Authorization` here. The standard
+`Bearer <token>` form needs a space between the scheme and the token, and
+Shortcuts' header fields can be awkward about accepting one; `X-Api-Token`
+carries the token by itself, so there's no space to fight over. The endpoint
+treats the two identically.
 
 Optionally add a step 7 — **Get Dictionary Value** for `link` → **Copy to
 Clipboard** — so the calendar URL is on your clipboard afterwards.
@@ -846,7 +861,9 @@ bug is in the Shortcut.
 | `Error creating Budget: 403 ... requires a quota project` | ADC user credentials with no quota project set | `gcloud auth application-default set-quota-project YOUR_PROJECT_ID` |
 | Instances fail to start, image pull error | Artifact Registry read grant hadn't propagated | Re-run `terraform apply` |
 | Duplicate events appear | Telegram retried a slow webhook | Known v1 gap — see below |
-| **Mac/iPhone:** `curl` returns `Forbidden` | Wrong or stale bearer token | Re-read it with `./scripts/api-token.sh`; check the header is `Bearer <token>` |
+| **Mac/iPhone:** `curl` returns `Forbidden` | Wrong or stale token | Re-read it with `./scripts/api-token.sh` |
+| Shortcuts won't accept a space in the header value | You're entering `Bearer <token>` | Use the `X-Api-Token` header instead — the token alone, no scheme, no space. Or put `Bearer <token>` in a **Text** action and use that as the value |
+| `Forbidden` from the Shortcut but `curl` works | Token pasted with a trailing newline or a smart quote | Re-copy from `./scripts/api-token.sh`; leading and trailing whitespace is stripped, but a quote character isn't |
 | **Mac/iPhone:** `curl` returns `API is not enabled` | `API_TOKEN` didn't reach the function | `terraform apply`; confirm the secret exists in Secret Manager |
 | Hotkey does nothing at all | Binder not reloaded, or the key is already taken | Reload it (`aerospace reload-config`, `skhd --restart-service`, …); check the combination isn't bound elsewhere, including by macOS itself |
 | Hotkey worked, then stopped | Services-menu registration went stale (Options 1 and 4 only) | Untick and re-tick **Services Menu** in Shortcut Details; if it recurs, move to a launcher or hotkey daemon |
@@ -1006,7 +1023,10 @@ compare with `hmac.compare_digest` rather than `==`.
 **On `/event` (the Mac and phone):**
 
 3. **The bearer token.** A 48-character generated token, mounted from Secret
-   Manager. No token, wrong token, or the wrong auth scheme is a 403.
+   Manager, compared with `hmac.compare_digest`. No token, wrong token, or an
+   auth scheme that isn't `Bearer` is a 403. It's read from `X-Api-Token` or
+   `Authorization`; which header carried it makes no difference to how it's
+   checked, so the space-free form gives up nothing.
 4. **It fails closed.** If `API_TOKEN` somehow isn't set on the function,
    `/event` returns 503 rather than serving unauthenticated requests. There is
    no configuration in which the endpoint is open.
