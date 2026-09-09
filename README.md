@@ -44,6 +44,8 @@ HTTP response.
 | `src/messages.py` | The message vocabulary every channel renders from |
 | `src/replies.py` | The seam between the handlers and whoever is listening |
 | `src/config.py` | Reading the environment |
+| `src/CONTEXT.md` | Optional. Your own notes, appended to both prompts |
+| `src/CONTEXT.md.example` | A starting point to copy |
 | `src/requirements.txt` | Python dependencies |
 | `terraform/` | All the infrastructure |
 | `terraform/terraform.tfvars.example` | Template for your settings |
@@ -452,6 +454,50 @@ far less patient, which is why [latency](#latency-is-the-thing-to-watch) gets
 its own section. A change is two LLM calls plus two calendar calls, so it runs
 a little longer than a create.
 
+### Teaching it about you
+
+The prompt knows how calendars work. It doesn't know that "the sync" is the
+Thursday platform sync, that "PT" is an hour of physical therapy, or that your
+gym is on Huntington Ave. Write any of that down in a file named
+`src/CONTEXT.md` and it gets appended to both system prompts, so the model
+reads it before every message:
+
+```bash
+cp src/CONTEXT.md.example src/CONTEXT.md
+$EDITOR src/CONTEXT.md
+terraform -chdir=terraform apply
+```
+
+It's plain markdown with no required structure — write it the way you'd brief
+a new assistant:
+
+```markdown
+- Sam is my manager. "1:1" with no name means my 1:1 with Sam.
+- "the office" is 100 Summer St, Boston. "home" means remote — no location.
+- Standup is every weekday at 9:15am, 15 minutes.
+- "PT" is physical therapy, always 1 hour.
+```
+
+Then *"PT tuesday morning"* books an hour, and *"1:1 tomorrow at 2"* is titled
+the way you'd title it yourself.
+
+Worth knowing:
+
+- **There is no file by default**, and without one nothing changes. The
+  behaviour described everywhere else in this guide is the no-context
+  behaviour.
+- **It's part of the deployment**, not a runtime setting — `src/` is what
+  Terraform zips, so an edit needs an `apply` like any other code change.
+- **Both calls see it**, so it helps with finding an existing event as much as
+  with creating one.
+- **Keep it short.** It rides along on every message you send, and past 8,000
+  characters it's truncated, with a line in the logs saying so.
+- **It's reference, not instruction.** The header above it tells the model the
+  notes can't change the JSON schema or the rules. Don't try to reprogram the
+  bot from in here; describe your life and let the prompt do the rest.
+- **`./scripts/try-parse.py` reads the same file**, and prints whether it found
+  one, so you can try a phrasing against your notes without deploying.
+
 ---
 
 ## Step 7 — Your Mac and your iPhone
@@ -755,6 +801,10 @@ zip's hash is part of the object name, so Terraform notices and redeploys.
 `src/` is zipped whole, so a new subpackage needs its own `__pycache__` line in
 the `excludes` in `terraform/main.tf`; stray bytecode changes the hash and
 forces a rebuild that deploys nothing new.
+
+**Teach it a name, a place or a habit.** Edit `src/CONTEXT.md` (see
+[teaching it about you](#teaching-it-about-you)) and `terraform apply`. It's
+inside the zip, so this redeploys the function.
 
 **Change the model or timezone.** Edit `terraform.tfvars`, `terraform apply`.
 These are plain environment variables — the redeploy is quick.

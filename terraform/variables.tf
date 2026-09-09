@@ -95,7 +95,7 @@ variable "llm_timeout_seconds" {
     7s and 26s. Keep this comfortably under var.function_timeout_seconds so a
     slow parse still leaves room to insert the event and reply.
   EOT
-  default     = 45
+  default     = 109
 
   validation {
     condition     = var.llm_timeout_seconds >= 5 && var.llm_timeout_seconds <= 540

@@ -71,6 +71,12 @@ def run(text: str) -> int:
 
     print(f"model:    {cfg['llm_model']}  @  {cfg['llm_base_url']}")
     print(f"timezone: {cfg['timezone']}  (now {now:%Y-%m-%d %H:%M %A})")
+    context = llm.owner_context()
+    print(
+        f"context:  {llm.CONTEXT_FILE.name}, {len(context)} chars"
+        if context
+        else f"context:  none ({llm.CONTEXT_FILE.name} not there)"
+    )
     print(f"message:  {text}\n")
 
     try:

@@ -1,0 +1,33 @@
+# Notes for Calendar Connect
+
+Copy this file to `src/CONTEXT.md` and make it yours. Everything in it is
+appended to both system prompts, so the model reads it before every message.
+Delete the file (or leave it out) and nothing changes — the bot behaves as it
+always did.
+
+It is plain markdown; the headings below are only a suggestion. Write it the
+way you'd brief a new assistant, and keep it short — every line is sent on
+every message.
+
+## People
+
+- Sam is my manager. "1:1" with no name means my 1:1 with Sam.
+- Alex is my partner. Anything with Alex is personal, not work.
+
+## Places
+
+- "the office" is 100 Summer St, Boston.
+- "the gym" is the YMCA on Huntington Ave.
+- "home" means I'm remote; leave the location empty for it.
+
+## Routines
+
+- Standup is every weekday at 9:15am and runs 15 minutes.
+- I don't book work meetings before 9am or after 6pm.
+- "Lunch" is 45 minutes unless I say otherwise.
+
+## My shorthand
+
+- "PT" is physical therapy, always 1 hour.
+- "the sync" is the Thursday platform sync.
+- "EOD" means an all-day event on that day, not 5pm.
